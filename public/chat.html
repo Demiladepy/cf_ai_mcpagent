@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+	<meta charset="UTF-8" />
+	<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+	<title>Resource Allocation – Chat</title>
+	<style>
+		:root { --bg: #0f0f12; --surface: #1a1a1f; --border: #2a2a32; --text: #e4e4e7; --muted: #71717a; --accent: #7c3aed; --accent-hover: #8b5cf6; }
+		* { box-sizing: border-box; }
+		body { font-family: system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); margin: 0; min-height: 100vh; }
+		.container { max-width: 720px; margin: 0 auto; padding: 1rem; display: flex; flex-direction: column; gap: 1rem; }
+		h1 { font-size: 1.25rem; font-weight: 600; margin: 0; }
+		.status { font-size: 0.875rem; color: var(--muted); }
+		.panel { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1rem; }
+		.panel h2 { font-size: 0.875rem; font-weight: 600; margin: 0 0 0.5rem 0; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+		#log { min-height: 200px; max-height: 40vh; overflow-y: auto; display: flex; flex-direction: column; gap: 0.5rem; }
+		.msg { padding: 0.5rem 0.75rem; border-radius: 6px; font-size: 0.9rem; max-width: 85%; }
+		.msg.user { background: var(--accent); color: #fff; align-self: flex-end; }
+		.msg.assistant { background: var(--border); align-self: flex-start; }
+		.row { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
+		input[type="text"] { flex: 1; min-width: 120px; padding: 0.5rem 0.75rem; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); color: var(--text); font-size: 1rem; }
+		button { padding: 0.5rem 1rem; border-radius: 6px; border: none; font-size: 0.9rem; cursor: pointer; font-weight: 500; }
+		button.primary { background: var(--accent); color: #fff; }
+		button.primary:hover { background: var(--accent-hover); }
+		button.secondary { background: var(--border); color: var(--text); }
+		button.secondary:hover { background: #3a3a45; }
+		button:disabled { opacity: 0.5; cursor: not-allowed; }
+		#stateAssignments, #stateNotifications { font-size: 0.875rem; margin: 0; padding-left: 1.25rem; }
+		#stateAssignments li, #stateNotifications li { margin: 0.25rem 0; }
+		.recommendations { font-size: 0.875rem; color: var(--muted); }
+		.recommendations ul { margin: 0.25rem 0 0 1rem; padding: 0; }
+	</style>
+</head>
+<body>
+	<div class="container">
+		<h1>Resource Allocation – Chat</h1>
+		<p class="status" id="status">Connecting…</p>
+
+		<div class="panel">
+			<h2>Realtime state</h2>
+			<p><strong>My assignments</strong></p>
+			<ul id="stateAssignments">—</ul>
+			<p><strong>Notifications</strong></p>
+			<ul id="stateNotifications">—</ul>
+		</div>
+
+		<div class="panel">
+			<h2>Chat</h2>
+			<div id="log"></div>
+			<div class="row" style="margin-top: 0.75rem;">
+				<label>User ID <input type="text" id="userId" value="user-1" placeholder="user-1" style="width: 100px;" /></label>
+				<input type="text" id="input" placeholder="Type a message or: request P1, return P1, list resources…" />
+				<button type="button" id="send" class="primary">Send</button>
+				<button type="button" id="voice" class="secondary" title="Record voice (sends transcript to chat)">🎤 Voice</button>
+			</div>
+			<div class="recommendations" id="recommendations"></div>
+		</div>
+	</div>
+
+	<script type="module">
+		const wsProtocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+		const wsUrl = `${wsProtocol}//${location.host}/agents/resource-allocation-agent/default`;
+		const pendingCalls = new Map();
+		let ws = null;
+
+		function setStatus(text) {
+			document.getElementById('status').textContent = text;
+		}
+
+		function connect() {
+			ws = new WebSocket(wsUrl);
+			ws.onopen = () => setStatus('Connected');
+			ws.onclose = () => setStatus('Disconnected');
+			ws.onerror = () => setStatus('Error');
+			ws.onmessage = (event) => {
+				try {
+					const msg = JSON.parse(event.data);
+					if (msg.type === 'cf_agent_state' && msg.state) {
+						updateStateUI(msg.state);
+					}
+					if (msg.type === 'rpc' && msg.id && pendingCalls.has(msg.id)) {
+						const { resolve, reject } = pendingCalls.get(msg.id);
+						pendingCalls.delete(msg.id);
+						if (msg.success) resolve(msg.result); else reject(new Error(msg.error));
+					}
+				} catch (_) {}
+			};
+		}
+
+		function call(method, args = []) {
+			return new Promise((resolve, reject) => {
+				if (!ws || ws.readyState !== WebSocket.OPEN) {
+					reject(new Error('Not connected'));
+					return;
+				}
+				const id = crypto.randomUUID();
+				pendingCalls.set(id, { resolve, reject });
+				ws.send(JSON.stringify({ type: 'rpc', id, method, args }));
+			});
+		}
+
+		function updateStateUI(state) {
+			const userId = document.getElementById('userId').value.trim() || 'user-1';
+			const assignments = (state.assignments || []).filter(a => a.userId === userId && a.status === 'active');
+			const notifications = (state.notifications || {})[userId] || [];
+			document.getElementById('stateAssignments').innerHTML = assignments.length
+				? assignments.map(a => `<li>${a.resourceId} (due ${(a.dueReturnAt || '—').slice(0, 10)})</li>`).join('')
+				: '<li>None</li>';
+			document.getElementById('stateNotifications').innerHTML = notifications.length
+				? notifications.map(n => `<li>${escapeHtml(n)}</li>`).join('')
+				: '<li>None</li>';
+		}
+
+		function escapeHtml(s) {
+			const div = document.createElement('div');
+			div.textContent = s;
+			return div.innerHTML;
+		}
+
+		function appendMessage(role, content) {
+			const log = document.getElementById('log');
+			const div = document.createElement('div');
+			div.className = `msg ${role}`;
+			div.textContent = content;
+			log.appendChild(div);
+			log.scrollTop = log.scrollHeight;
+		}
+
+		async function loadRecommendations() {
+			const userId = document.getElementById('userId').value.trim() || 'user-1';
+			try {
+				const list = await call('getRecommendations', [userId]);
+				const el = document.getElementById('recommendations');
+				if (Array.isArray(list) && list.length) {
+					el.innerHTML = '<strong>Suggestions:</strong><ul>' + list.map(s => '<li>' + escapeHtml(s) + '</li>').join('') + '</ul>';
+				} else {
+					el.innerHTML = '';
+				}
+			} catch (_) {
+				document.getElementById('recommendations').innerHTML = '';
+			}
+		}
+
+		async function sendMessage() {
+			const input = document.getElementById('input');
+			const userId = document.getElementById('userId').value.trim() || 'user-1';
+			const text = input.value.trim();
+			if (!text) return;
+			input.value = '';
+			appendMessage('user', text);
+			document.getElementById('send').disabled = true;
+			try {
+				const reply = await call('handleChat', [userId, text]);
+				appendMessage('assistant', reply);
+				loadRecommendations();
+			} catch (e) {
+				appendMessage('assistant', 'Error: ' + e.message);
+			}
+			document.getElementById('send').disabled = false;
+		}
+
+		// Voice: record -> POST /api/voice -> put transcript in input and send
+		let mediaRecorder = null;
+		let chunks = [];
+		const voiceBtn = document.getElementById('voice');
+		voiceBtn.addEventListener('click', async () => {
+			if (mediaRecorder && mediaRecorder.state === 'recording') {
+				mediaRecorder.stop();
+				return;
+			}
+			try {
+				const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+				mediaRecorder = new MediaRecorder(stream);
+				chunks = [];
+				mediaRecorder.ondataavailable = (e) => e.data.size && chunks.push(e.data);
+				mediaRecorder.onstop = async () => {
+					stream.getTracks().forEach(t => t.stop());
+					voiceBtn.textContent = '🎤 Voice';
+					const blob = new Blob(chunks, { type: 'audio/webm' });
+					const form = new FormData();
+					form.append('audio', blob);
+					try {
+						const r = await fetch('/api/voice', { method: 'POST', body: form });
+						const data = await r.json();
+						const text = (data && data.text) ? data.text.trim() : '';
+						if (text) {
+							document.getElementById('input').value = text;
+							await sendMessage();
+						} else {
+							appendMessage('assistant', 'No speech detected or transcription failed.');
+						}
+					} catch (e) {
+						appendMessage('assistant', 'Voice transcription failed: ' + e.message);
+					}
+				};
+				mediaRecorder.start();
+				voiceBtn.textContent = '⏹ Stop';
+			} catch (e) {
+				appendMessage('assistant', 'Microphone access denied or error: ' + e.message);
+			}
+		});
+
+		document.getElementById('send').addEventListener('click', sendMessage);
+		document.getElementById('input').addEventListener('keydown', (e) => { if (e.key === 'Enter') sendMessage(); });
+
+		connect();
+	</script>
+</body>
+</html>

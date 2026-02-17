@@ -45,16 +45,21 @@ export type UtilizationLogEntry = {
 	total: number;
 };
 
+export type ConversationMessage = { role: "user" | "assistant"; content: string };
+
 export type ResourceAllocationState = {
 	resources: Resource[];
 	assignments: Assignment[];
 	waitlist: WaitlistEntry[];
 	utilizationLog: UtilizationLogEntry[];
 	notifications: Record<string, string[]>;
+	/** Bounded per-user conversation history for LLM context. */
+	conversationByUser: Record<string, ConversationMessage[]>;
 };
 
 export type Env = {
 	ResourceAllocationAgent: DurableObjectNamespace;
+	AI: Ai;
 	SLACK_MCP_URL?: string;
 	EMAIL_MCP_URL?: string;
 };
@@ -65,6 +70,8 @@ export type Env = {
 
 const REMINDER_CRON = "0 9 * * *";
 const REMINDER_HOURS_AHEAD = 24;
+const CONVERSATION_CAP_PER_USER = 20;
+const LLAMA_MODEL = "@cf/meta/llama-3.1-8b-instruct-fast";
 
 const DEFAULT_RESOURCES: Resource[] = [
 	{ id: "P1", type: "parking", name: "Parking Spot 1", quantity: 1, metadata: { location: "Lot A" } },
@@ -99,6 +106,21 @@ function formatAssignmentLine(a: Assignment): string {
 	return `${a.resourceId} (assigned ${a.assignedAt.slice(0, 10)}${due})`;
 }
 
+function appendConversation(
+	conversationByUser: Record<string, ConversationMessage[]>,
+	userId: string,
+	userContent: string,
+	assistantContent: string
+): Record<string, ConversationMessage[]> {
+	const prev = conversationByUser[userId] ?? [];
+	const next = [
+		...prev,
+		{ role: "user" as const, content: userContent },
+		{ role: "assistant" as const, content: assistantContent },
+	].slice(-CONVERSATION_CAP_PER_USER);
+	return { ...conversationByUser, [userId]: next };
+}
+
 // ---------------------------------------------------------------------------
 // Agent
 // ---------------------------------------------------------------------------
@@ -110,6 +132,7 @@ export class ResourceAllocationAgent extends Agent<Env, ResourceAllocationState>
 		waitlist: [],
 		utilizationLog: [],
 		notifications: {},
+		conversationByUser: {},
 	};
 
 	override async onStart(): Promise<void> {
@@ -120,7 +143,11 @@ export class ResourceAllocationAgent extends Agent<Env, ResourceAllocationState>
 
 	private seedResourcesIfEmpty(): void {
 		if (this.state.resources.length > 0) return;
-		this.setState({ ...this.state, resources: [...DEFAULT_RESOURCES] });
+		this.setState({
+			...this.state,
+			conversationByUser: this.state.conversationByUser ?? {},
+			resources: [...DEFAULT_RESOURCES],
+		});
 	}
 
 	private async registerMcpServers(): Promise<void> {
@@ -354,46 +381,178 @@ export class ResourceAllocationAgent extends Agent<Env, ResourceAllocationState>
 	}
 
 	@callable()
-	async handleChat(userId: string, message: string): Promise<string> {
-		const trimmed = message.trim().toLowerCase();
+	async getRecommendations(userId: string): Promise<string[]> {
+		const stateSummary = this.buildStateSummary(userId);
+		const systemPrompt = `You are the resource allocation assistant. Based on current state, suggest 1-5 short recommendations (e.g. "Consider requesting P2", "You have L1; return by Friday"). Reply with only the suggestions, one per line, no numbering or extra text.`;
+		const messages: Array<{ role: "system" | "user"; content: string }> = [
+			{ role: "system", content: systemPrompt },
+			{ role: "user", content: stateSummary },
+		];
+		try {
+			const result = (await this.env.AI.run(LLAMA_MODEL, {
+				messages,
+				max_tokens: 256,
+			})) as { response?: string };
+			const text = typeof result?.response === "string" ? result.response.trim() : "";
+			if (!text) return [];
+			return text
+				.split(/\n+/)
+				.map((s) => s.replace(/^[\d.)\-\*]\s*/, "").trim())
+				.filter(Boolean);
+		} catch (e) {
+			console.error("[ResourceAllocationAgent] getRecommendations failed:", e);
+			return [];
+		}
+	}
 
-		const requestMatch = trimmed.match(/request\s+(?:resource\s+)?(\S+)/);
+	@callable()
+	async handleChat(userId: string, message: string): Promise<string> {
+		const trimmed = message.trim();
+		const trimmedLower = trimmed.toLowerCase();
+		const conversationByUser = this.state.conversationByUser ?? {};
+
+		const requestMatch = trimmedLower.match(/request\s+(?:resource\s+)?(\S+)/);
 		if (requestMatch) {
 			const res = await this.requestResource(requestMatch[1].toUpperCase(), userId);
+			this.setState({
+				...this.state,
+				conversationByUser: appendConversation(
+					conversationByUser,
+					userId,
+					trimmed,
+					res.message
+				),
+			});
 			return res.message;
 		}
 
-		const returnMatch = trimmed.match(/return\s+(?:resource\s+)?(\S+)/);
+		const returnMatch = trimmedLower.match(/return\s+(?:resource\s+)?(\S+)/);
 		if (returnMatch) {
 			const res = await this.returnResource(returnMatch[1].toUpperCase(), userId);
+			this.setState({
+				...this.state,
+				conversationByUser: appendConversation(
+					conversationByUser,
+					userId,
+					trimmed,
+					res.message
+				),
+			});
 			return res.message;
 		}
 
-		if (/\b(my\s+)?(assignments|what\s+do\s+i\s+have|list\s+mine)\b/.test(trimmed)) {
+		if (/\b(my\s+)?(assignments|what\s+do\s+i\s+have|list\s+mine)\b/.test(trimmedLower)) {
 			const list = await this.listMyAssignments(userId);
-			if (list.length === 0) return "You have no current assignments.";
-			return list.map(formatAssignmentLine).join("\n");
+			const reply =
+				list.length === 0
+					? "You have no current assignments."
+					: list.map(formatAssignmentLine).join("\n");
+			this.setState({
+				...this.state,
+				conversationByUser: appendConversation(
+					conversationByUser,
+					userId,
+					trimmed,
+					reply
+				),
+			});
+			return reply;
 		}
 
-		if (/\b(list\s+)?resources\b/.test(trimmed)) {
+		if (/\b(list\s+)?resources\b/.test(trimmedLower)) {
 			const list = await this.listResources();
-			return list
+			const reply = list
 				.map((r) => `${r.id} ${r.name}: ${r.available}/${r.quantity} available`)
 				.join("\n");
+			this.setState({
+				...this.state,
+				conversationByUser: appendConversation(
+					conversationByUser,
+					userId,
+					trimmed,
+					reply
+				),
+			});
+			return reply;
 		}
 
-		if (/\butilization\b/.test(trimmed)) {
+		if (/\butilization\b/.test(trimmedLower)) {
 			const { byResource } = await this.getUtilization();
-			if (byResource.length === 0) return "No utilization data for this period.";
-			return byResource
-				.map(
-					(e) =>
-						`${e.resourceId} ${e.date}: ${(e.utilization * 100).toFixed(0)}% (${e.allocated}/${e.total})`
-				)
-				.join("\n");
+			const reply =
+				byResource.length === 0
+					? "No utilization data for this period."
+					: byResource
+							.map(
+								(e) =>
+									`${e.resourceId} ${e.date}: ${(e.utilization * 100).toFixed(0)}% (${e.allocated}/${e.total})`
+							)
+							.join("\n");
+			this.setState({
+				...this.state,
+				conversationByUser: appendConversation(
+					conversationByUser,
+					userId,
+					trimmed,
+					reply
+				),
+			});
+			return reply;
 		}
 
-		return "Say: request <id>, return <id>, list resources, what do I have, or utilization.";
+		// No regex match: use Llama with system prompt, state summary, and conversation history
+		const stateSummary = this.buildStateSummary(userId);
+		const history = conversationByUser[userId] ?? [];
+		const lastN = history.slice(-CONVERSATION_CAP_PER_USER);
+		const messages: Array<{ role: "system" | "user" | "assistant"; content: string }> = [
+			{ role: "system", content: this.getSystemPrompt() + "\n\n" + stateSummary },
+			...lastN.map((m) => ({ role: m.role, content: m.content })),
+			{ role: "user", content: trimmed },
+		];
+		let reply: string;
+		try {
+			const result = (await this.env.AI.run(LLAMA_MODEL, {
+				messages,
+				max_tokens: 512,
+			})) as { response?: string };
+			reply =
+				typeof result?.response === "string" && result.response.trim()
+					? result.response.trim()
+					: "I couldn't generate a response. Try: request <id>, return <id>, list resources, or ask for recommendations.";
+		} catch (e) {
+			console.error("[ResourceAllocationAgent] Llama run failed:", e);
+			reply =
+				"Something went wrong with the assistant. You can still say: request <id>, return <id>, list resources, or utilization.";
+		}
+		this.setState({
+			...this.state,
+			conversationByUser: appendConversation(conversationByUser, userId, trimmed, reply),
+		});
+		return reply;
+	}
+
+	private getSystemPrompt(): string {
+		const resourceList = (this.state.resources ?? [])
+			.map((r) => `${r.id} (${r.name})`)
+			.join(", ");
+		return `You are the resource allocation assistant. Users can request or return resources by id, list resources, list their assignments, or ask for recommendations.
+Available resource IDs and names: ${resourceList || "None yet."}
+Commands: request <id>, return <id>, list resources, list my assignments (or "what do I have"), utilization.
+When relevant, suggest available resources or next actions (e.g. return by due date, or request something they don't have). Keep replies concise.`;
+	}
+
+	private buildStateSummary(userId: string): string {
+		const assignments = (this.state.assignments ?? []).filter(
+			(a) => a.userId === userId && a.status === "active"
+		);
+		const waitlist = (this.state.waitlist ?? []).filter((w) => w.userId === userId);
+		const notifCount = (this.state.notifications ?? {})[userId]?.length ?? 0;
+		const lines: string[] = [
+			"Current state for this user:",
+			`Assignments: ${assignments.length === 0 ? "none" : assignments.map(formatAssignmentLine).join("; ")}`,
+			`Waitlist positions: ${waitlist.length === 0 ? "none" : waitlist.map((w) => w.resourceId).join(", ")}`,
+			`Unread notifications: ${notifCount}`,
+		];
+		return lines.join("\n");
 	}
 
 	async checkReturnReminders(_payload: Record<string, never>): Promise<void> {

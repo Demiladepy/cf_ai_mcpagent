@@ -1,6 +1,8 @@
 interface Env {
 	ResourceAllocationAgent: DurableObjectNamespace;
 	ASSETS?: Fetcher;
+	/** Workers AI binding for Llama and Whisper. */
+	AI: Ai;
 	/** Optional MCP server URL for Slack/Teams notifications (opt-in). */
 	SLACK_MCP_URL?: string;
 	/** Optional MCP server URL for email notifications (opt-in). */
