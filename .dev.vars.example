@@ -1,0 +1,12 @@
+# Optional: add API keys here if you add LLM-driven chat later.
+# OPENAI_API_KEY=your_key
+
+# Optional: MCP server URLs for notifications (Slack/Teams, Email).
+# When set, the agent will register these MCP servers in onStart and send
+# notifications for waitlist position, resource available, and return reminders.
+# Tool names (send_message, send_email) and argument shapes depend on your MCP server.
+# SLACK_MCP_URL=https://your-slack-mcp.example.com/mcp
+# EMAIL_MCP_URL=https://your-email-mcp.example.com/mcp
+
+# Copy to .dev.vars for local development:
+# cp .dev.vars.example .dev.vars
